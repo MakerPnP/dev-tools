@@ -132,7 +132,7 @@ impl FlashAlgorithm for Algorithm {
     }
 
     fn blank_check(&mut self, address: u32, size: u32, pattern: u8) -> Result<(), ErrorCode> {
-        rprintln!("Blank check. logical_address: 0x{:08x}, size: 0x{:08x} ({}), pattern: 0x{:08x} (0b{:08b})", address, size, size, pattern, pattern);
+        rprintln!("Blank check. logical_address: 0x{:08x}, size: 0x{:08x} ({}), pattern: 0x{:02x} (0b{:08b})", address, size, size, pattern, pattern);
         Err(ErrorCode::new(42).unwrap())
     }
 }
