@@ -80,6 +80,7 @@ impl FlashAlgorithm for Algorithm {
         if flash_id != [0xef, 0x40, 0x15] {
             return Err(ErrorCode::new(flash_id[0] as u32).unwrap());
         }
+
         rprintln!("Init complete, flash ID as-expected");
         Ok(Self { flash, led, fpga_creset_b })
     }
@@ -111,6 +112,28 @@ impl FlashAlgorithm for Algorithm {
         rprintln!("Program Page. addr: 0x{:08x}, size: 0x{:08x} ({})", address, len, len);
         // TODO: Add code here that writes a page to flash.
         Ok(())
+    }
+
+    fn verify(
+        &mut self,
+        _address: u32,
+        _size: u32,
+        _data: Option<&[u8]>,
+    ) -> Result<(), u32> {
+        rprintln!("Verify. logical address: {}, size: {}",_address, _size);
+        //todo!()
+        // just return the supplied first address as the error address
+        Err(_address)
+    }
+
+    fn read_flash(&mut self, address: u32, data: &mut [u8]) -> Result<(), ErrorCode> {
+        rprintln!("Read. logical_address: 0x{:08x}", address);
+        Err(ErrorCode::new(42).unwrap())
+    }
+
+    fn blank_check(&mut self, address: u32, size: u32, pattern: u8) -> Result<(), ErrorCode> {
+        rprintln!("Blank check. logical_address: 0x{:08x}, size: 0x{:08x} ({}), pattern: 0x{:08x} (0b{:08b})", address, size, size, pattern, pattern);
+        Err(ErrorCode::new(42).unwrap())
     }
 }
 
@@ -356,8 +379,10 @@ mod rcc_setup {
 
         config.rcc.mux.octospisel = Fmcsel::Pll2R; // 133.33Mhz
 
-        rprintln!("PWR::CR3 = 0x{:08x}", pac::PWR.cr3().read().0);
-        rprintln!("RCC::AHB4ENR = 0x{:08x}", pac::RCC.ahb4enr().read().0);
+        let reg = pac::PWR.cr3().read();
+        rprintln!("PWR::CR3 = 0x{:08x} {:?}", reg.0, reg);
+        let reg = pac::RCC.ahb4enr().read();
+        rprintln!("RCC::AHB4ENR = 0x{:08x} {:?}", reg.0, reg);
         rprintln!("Full init");
         embassy_stm32::init(config)
     }
