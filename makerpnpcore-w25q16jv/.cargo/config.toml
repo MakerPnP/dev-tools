@@ -6,6 +6,8 @@ rustflags = [
   "link-arg=-Tlink.x",
   "-C",
   "link-arg=-Tmemory.x",
+  "-C",
+  "link-arg=-Map=output.map",
   # Code-size optimizations.
   # This requires nightly atm.
   # "-Z",
