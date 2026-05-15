@@ -336,17 +336,27 @@ impl Flash {
 
         let status = StatusReg::from_raw(buffer[0]);
 
-        rprintln!("Status: {:?} ({})", status, status.value());
-
         status
     }
 
     fn wait_write_finish(&mut self) {
+        let mut recent_status: Option<StatusReg> = None;
+
         loop {
             let status = self.read_status1();
+            let print = match &recent_status {
+                Some(previous) if *previous != status => true,
+                None => true,
+                _ => false,
+            };
+            if print {
+                rprintln!("Status: {:?} ({})", status, status.value());
+            }
             if !status.is_writing() {
                 break
             }
+
+            recent_status.replace(status);
         }
     }
 
@@ -421,6 +431,7 @@ mod status_register_bits {
 
 pub use status_register_bits::*;
 
+#[derive(Eq, PartialEq)]
 struct StatusReg(u8);
 
 impl StatusReg {
