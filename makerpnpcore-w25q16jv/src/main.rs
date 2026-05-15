@@ -3,16 +3,23 @@
 
 use core::fmt::{Debug, Formatter, Write};
 use embassy_stm32::gpio::{Level, Output, Speed};
-use embassy_stm32::ospi::{AddressSize, Ospi, OspiWidth, TransferConfig};
+use embassy_stm32::ospi::{AddressSize, DummyCycles, Ospi, OspiWidth, TransferConfig};
 use embassy_stm32::{ospi, Peri};
 use embassy_stm32::ospi::{ChipSelectHighTime, FIFOThresholdLevel, MemorySize, MemoryType, WrapSize};
 use embassy_stm32::peripherals::{PC3, PD4, PE10, PF4, PG12, PH3};
 use embassy_time::{block_for, Duration};
 use flash_algorithm::*;
-use rtt_target::{rprintln, rtt_init_print};
+use rtt_target::{rprint, rprintln, rtt_init_print};
+
+#[repr(u32)]
+enum ErrorCodes {
+    VerificationError = 1,
+}
 
 const OCTOSPI2_MEMORY_MAPPED_ADDRESS: u32 = 0x70000000;
 const FLASH_SIZE: u32 = 0x200000;
+const ERASED_VALUE: u8 = 0xff;
+const PAGE_SIZE: u16 = 0x100;
 
 struct Algorithm {
     flash: Flash,
@@ -25,8 +32,8 @@ algorithm!(Algorithm, {
     device_type: DeviceType::ExtSpi,
     flash_address: OCTOSPI2_MEMORY_MAPPED_ADDRESS,
     flash_size: FLASH_SIZE,
-    page_size: 0x100,
-    empty_value: 0xFF,
+    page_size: PAGE_SIZE,
+    empty_value: ERASED_VALUE,
     // TODO
     program_time_out: 1000,
     // TODO
@@ -81,6 +88,11 @@ impl FlashAlgorithm for Algorithm {
             return Err(ErrorCode::new(flash_id[0] as u32).unwrap());
         }
 
+        let mut buffer: [u8; PAGE_SIZE as usize] = [0; PAGE_SIZE as usize];
+
+        flash.read_quad_output_blocking(0x00000000, &mut buffer);
+        dump_chunk(&buffer);
+
         rprintln!("Init complete, flash ID as-expected");
         Ok(Self { flash, led, fpga_creset_b })
     }
@@ -96,7 +108,7 @@ impl FlashAlgorithm for Algorithm {
         // Err(ErrorCode::new(0x....).unwrap())
         rprintln!("Erase sector addr: 0x{:08x}", address);
 
-        let physical_address = address - OCTOSPI2_MEMORY_MAPPED_ADDRESS;
+        let physical_address = Self::logical_to_physical(address);
         rprintln!("Physical addr: 0x{:08x}", physical_address);
 
         // TODO validate that physical address starts on a sector boundary (0 <= n < size - sector_size)?
@@ -110,7 +122,8 @@ impl FlashAlgorithm for Algorithm {
     fn program_page(&mut self, address: u32, buffer: &[u8]) -> Result<(), ErrorCode> {
         let len = buffer.len();
         rprintln!("Program Page. addr: 0x{:08x}, size: 0x{:08x} ({})", address, len, len);
-        // TODO: Add code here that writes a page to flash.
+        let physical_address = Self::logical_to_physical(address);
+        self.flash.program_page_blocking(physical_address, buffer);
         Ok(())
     }
 
@@ -124,16 +137,76 @@ impl FlashAlgorithm for Algorithm {
         //todo!()
         // just return the supplied first address as the error address
         Err(_address)
+        //Ok(())
     }
 
     fn read_flash(&mut self, address: u32, data: &mut [u8]) -> Result<(), ErrorCode> {
         rprintln!("Read. logical_address: 0x{:08x}", address);
-        Err(ErrorCode::new(42).unwrap())
+        let physical_address = Self::logical_to_physical(address);
+        self.flash.read_quad_output_blocking(physical_address, data);
+
+        Ok(())
     }
 
     fn blank_check(&mut self, address: u32, size: u32, pattern: u8) -> Result<(), ErrorCode> {
         rprintln!("Blank check. logical_address: 0x{:08x}, size: 0x{:08x} ({}), pattern: 0x{:02x} (0b{:08b})", address, size, size, pattern, pattern);
-        Err(ErrorCode::new(42).unwrap())
+        let physical_address = Self::logical_to_physical(address);
+
+        let mut chunk_buffer: [u8; 4096] = [0; 4096];
+
+        let mut remaining: usize = size as usize;
+        while remaining > 0 {
+            let chunk_size: usize = remaining.min(4096);
+            let chunk = &mut chunk_buffer[0..chunk_size];
+            rprintln!("Reading: 0x{:08x}, size: 0x{:08x} ({})", physical_address, chunk.len(), chunk.len());
+
+            self.flash.read_quad_output_blocking(physical_address, chunk);
+
+            if false {
+                dump_chunk(chunk);
+            }
+            remaining -= chunk_size;
+
+            for (_index, byte) in chunk.iter().enumerate() {
+                if *byte != pattern {
+                    // TODO is would be good to report the offset and the actual byte value that was different.
+                    return Err(ErrorCode::new(ErrorCodes::VerificationError as u32).unwrap())
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn dump_chunk(chunk: &[u8]) {
+    const ITEMS_PER_LINE: usize = 32;
+
+    // time allowed for the per-line rtt buffer to be read.
+    let rtt_line_period = Duration::from_millis(3);
+
+    let lines = (chunk.len() + ITEMS_PER_LINE - 1) / ITEMS_PER_LINE;
+
+    let mut offset: usize = 0;
+    for _ in 0..lines {
+        rprint!("0x{:08x}: ", offset);
+        for index in 0..ITEMS_PER_LINE {
+            rprint!("{:02x}", chunk[offset]);
+            if index % 8 == 0 {
+                rprint!("")
+            }
+            offset += 1;
+        }
+
+        rprintln!("");
+
+        block_for(rtt_line_period);
+    }
+}
+
+impl Algorithm {
+    fn logical_to_physical(address: u32) -> u32 {
+        address - OCTOSPI2_MEMORY_MAPPED_ADDRESS
     }
 }
 
@@ -153,6 +226,9 @@ mod commands {
     pub const CMD_WRITE_ENABLE: u8 = 0x06;
     pub const CMD_READ_STATUS_1: u8 = 0x05;
     pub const CMD_SECTOR_ERASE: u8 = 0x20;
+    pub const CMD_FAST_READ_QUAD_OUTPUT: u8 = 0x6b;
+
+    pub const CMD_PAGE_PROGRAM: u8 = 0x02;
 }
 use commands::*;
 
@@ -275,6 +351,8 @@ impl Flash {
     }
 
     fn erase_sector_blocking(&mut self, address: u32) {
+        self.exec_command(CMD_WRITE_ENABLE);
+
         let transaction: TransferConfig = TransferConfig {
             iwidth: OspiWidth::SING,
             isize: AddressSize::_8Bit,
@@ -289,6 +367,50 @@ impl Flash {
         rprintln!("Waiting for write to finish");
         self.wait_write_finish();
         rprintln!("OK");
+    }
+
+    pub fn read_quad_output_blocking(&mut self, address: u32, buffer: &mut [u8]) {
+        let transaction: TransferConfig = TransferConfig {
+            iwidth: OspiWidth::SING,
+            instruction: Some(CMD_FAST_READ_QUAD_OUTPUT as u32),
+            isize: AddressSize::_8Bit,
+
+            adwidth: OspiWidth::SING,
+            address: Some(address),
+            adsize: AddressSize::_24bit,
+
+            dwidth: OspiWidth::QUAD,
+
+            dummy: DummyCycles::_8,
+            ..Default::default()
+        };
+        rprintln!("read_quad_output. address: 0x{:08x}, data_length: {:?}", address, buffer.len());
+        self.ospi.blocking_read(buffer, transaction).unwrap()
+    }
+
+    pub(crate) fn program_page_blocking(&mut self, address: u32, buffer: &[u8]) {
+        // TODO check that buffer length <= page size
+
+        self.exec_command(CMD_WRITE_ENABLE);
+
+        let transaction: TransferConfig = TransferConfig {
+            iwidth: OspiWidth::SING,
+            instruction: Some(CMD_PAGE_PROGRAM as u32),
+            isize: AddressSize::_8Bit,
+
+            adwidth: OspiWidth::SING,
+            address: Some(address),
+            adsize: AddressSize::_24bit,
+
+            dwidth: OspiWidth::SING,
+
+            ..Default::default()
+        };
+        rprintln!("page_program. address: 0x{:08x}, data_length: {:?}", address, buffer.len());
+
+        self.ospi.blocking_write(buffer, transaction).unwrap();
+
+        self.wait_write_finish();
     }
 }
 
