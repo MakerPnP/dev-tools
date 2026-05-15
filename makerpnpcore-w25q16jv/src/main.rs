@@ -34,10 +34,8 @@ algorithm!(Algorithm, {
     flash_size: FLASH_SIZE,
     page_size: PAGE_SIZE,
     empty_value: ERASED_VALUE,
-    // TODO
-    program_time_out: 1000,
-    // TODO
-    erase_time_out: 2000,
+    program_time_out: 3_000, // tPP_MAX = 3ms, tPP_TYP = 0.4ms
+    erase_time_out: 25_000, // tCE_MAX = 25s, tCE_TYP = 5s
     sectors: [{
         size: 0x1000,
         address: 0x0,
