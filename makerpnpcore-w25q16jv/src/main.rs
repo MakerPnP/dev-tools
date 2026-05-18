@@ -554,3 +554,13 @@ mod rcc_setup {
         embassy_stm32::init(config)
     }
 }
+
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    rprintln!("I panicked");
+
+    unsafe {
+        core::arch::asm!("udf #0");
+        core::hint::unreachable_unchecked();
+    }
+}
