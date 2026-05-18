@@ -8,13 +8,13 @@
 #![no_std]
 #![no_main]
 
+use core::arch::asm;
 use core::fmt::{Debug, Formatter, Write};
 use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::ospi::{AddressSize, DummyCycles, Ospi, OspiError, OspiWidth, TransferConfig};
 use embassy_stm32::{ospi, Peri};
 use embassy_stm32::ospi::{ChipSelectHighTime, FIFOThresholdLevel, MemorySize, MemoryType, WrapSize};
 use embassy_stm32::peripherals::{PC3, PD4, PE10, PF4, PG12, PH3};
-use embassy_time::{block_for, Duration};
 use flash_algorithm::*;
 use rtt_target::{rprint, rprintln, rtt_init_print};
 
@@ -198,7 +198,7 @@ fn dump_chunk(chunk: &[u8]) {
     const ITEMS_PER_LINE: usize = 32;
 
     // time allowed for the per-line rtt buffer to be read.
-    let rtt_line_period = Duration::from_millis(3);
+    let rtt_line_period = 3 * 1000;
 
     let lines = (chunk.len() + ITEMS_PER_LINE - 1) / ITEMS_PER_LINE;
 
@@ -304,11 +304,11 @@ impl Flash {
     }
 
     /// reset the flash chip, the caller must wait for the returned time before issuing further commannds
-    pub fn reset(&mut self) -> Result<Duration, FlashError> {
+    pub fn reset(&mut self) -> Result<u32, FlashError> {
         self.exec_command(CMD_ENABLE_RESET)?;
         self.exec_command(CMD_RESET_DEVICE)?;
 
-        Ok(Duration::from_micros(30))
+        Ok(30)
     }
 
     pub fn exec_command(&mut self, cmd: u8) -> Result<(), FlashError> {
@@ -340,7 +340,7 @@ impl Flash {
     pub fn chip_erase_blocking(&mut self) -> Result<(), FlashError> {
         self.exec_command(CMD_WRITE_ENABLE)?;
         self.exec_command(CMD_CHIP_ERASE)?;
-        self.wait_write_finish(Duration::from_millis(250))
+        self.wait_write_finish(250 * 1000)
     }
 
     pub fn read_status1(&mut self) -> Result<StatusReg, FlashError> {
@@ -361,7 +361,7 @@ impl Flash {
             .map_err(FlashError::OspiError)
     }
 
-    fn wait_write_finish(&mut self, re_check_duration: Duration) -> Result<(), FlashError> {
+    fn wait_write_finish(&mut self, re_check_duration: u32) -> Result<(), FlashError> {
         let mut recent_status: Option<StatusReg> = None;
 
         loop {
@@ -402,7 +402,7 @@ impl Flash {
         self.ospi.blocking_command(&transaction)
             .map_err(FlashError::OspiError)?;
         rprintln!("Waiting for write to finish");
-        self.wait_write_finish(Duration::from_millis(5))?;
+        self.wait_write_finish(5 * 1000)?;
         rprintln!("OK");
         Ok(())
     }
@@ -450,7 +450,7 @@ impl Flash {
 
         self.ospi.blocking_write(buffer, transaction).unwrap();
 
-        self.wait_write_finish(Duration::from_micros(100))?;
+        self.wait_write_finish(100)?;
         Ok(())
     }
 }
@@ -563,4 +563,15 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
         core::arch::asm!("udf #0");
         core::hint::unreachable_unchecked();
     }
+}
+
+fn block_for(micros: u32) {
+
+    // naive implementation for testing
+    for _ in 0..micros {
+        unsafe {
+            asm!("nop");
+        }
+    }
+
 }
