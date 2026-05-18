@@ -141,15 +141,49 @@ impl FlashAlgorithm for Algorithm {
 
     fn verify(
         &mut self,
-        _address: u32,
-        _size: u32,
-        _data: Option<&[u8]>,
+        address: u32,
+        size: u32,
+        data: Option<&[u8]>,
     ) -> Result<(), u32> {
-        rprintln!("Verify. logical address: {}, size: {}",_address, _size);
-        //todo!()
-        // just return the supplied first address as the error address
-        Err(_address)
-        //Ok(())
+        rprintln!("Verify. logical address: {}, size: {}, verify_data: {} ",address, size, data.is_some());
+        if let Some(data) = data {
+
+            let physical_address = Self::logical_to_physical(address);
+
+            let mut offset: u32 = 0;
+            let mut chunk_buffer: [u8; 4096] = [0; 4096];
+
+            let mut remaining: usize = size as usize;
+            while remaining > 0 {
+                let chunk_size: usize = remaining.min(4096);
+                let chunk = &mut chunk_buffer[0..chunk_size];
+                rprintln!("Reading: 0x{:08x}, size: 0x{:08x} ({})", physical_address, chunk.len(), chunk.len());
+
+                self.flash.read_quad_output_blocking(physical_address, chunk)
+                    .map_err(|_ospi_error|ErrorCode::new(ErrorCodes::BusError as u32).unwrap())?;
+
+                if false {
+                    dump_chunk(chunk);
+                }
+                remaining -= chunk_size;
+
+                for (_index, byte) in chunk.iter().enumerate() {
+                    let expected = data[offset as usize];
+                    let actual = *byte;
+                    if actual != expected {
+                        rprintln!("Verification failed. offset: 0x{:08x}, expected: 0x{:02x}, actual: 0x{:02x}", offset, expected, actual);
+                        // TODO it would be good to report the offset and the actual byte value that was different via the API itself.
+                        return Err(offset)
+                    }
+                    offset += 1;
+                }
+            }
+
+            Ok(())
+        } else {
+            // FIXME What is the intention of having `data` being an Option? What is supposed to be verified?!?
+            Ok(())
+        }
     }
 
     fn read_flash(&mut self, address: u32, data: &mut [u8]) -> Result<(), ErrorCode> {
@@ -168,6 +202,8 @@ impl FlashAlgorithm for Algorithm {
         let mut chunk_buffer: [u8; 4096] = [0; 4096];
 
         let mut remaining: usize = size as usize;
+        let mut offset: u32 = 0;
+
         while remaining > 0 {
             let chunk_size: usize = remaining.min(4096);
             let chunk = &mut chunk_buffer[0..chunk_size];
@@ -183,9 +219,11 @@ impl FlashAlgorithm for Algorithm {
 
             for (_index, byte) in chunk.iter().enumerate() {
                 if *byte != pattern {
-                    // TODO is would be good to report the offset and the actual byte value that was different.
+                    // TODO it would be good to report the offset and the actual byte value that was different via the API itself.
+                    rprintln!("Verification failed. offset: 0x{:08x}, expected: 0x{:02x}, actual: 0x{:02x}", offset, pattern, *byte);
                     return Err(ErrorCode::new(ErrorCodes::VerificationError as u32).unwrap())
                 }
+                offset += 1;
             }
         }
 
