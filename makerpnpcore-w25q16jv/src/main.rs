@@ -11,6 +11,7 @@
 use panic_probe as _;
 
 use core::arch::asm;
+use core::cell::RefCell;
 use core::fmt::{Debug, Formatter, Write};
 use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::ospi::{AddressSize, DummyCycles, Ospi, OspiError, OspiWidth, TransferConfig};
@@ -19,12 +20,14 @@ use embassy_stm32::ospi::{ChipSelectHighTime, FIFOThresholdLevel, MemorySize, Me
 use embassy_stm32::peripherals::{PC3, PD4, PE10, PF4, PG12, PH3};
 use flash_algorithm::*;
 use rtt_target::{rprint, rprintln, rtt_init_print};
+use rtt_target::export::critical_section::Mutex;
 
 #[repr(u32)]
 enum ErrorCodes {
     UnknownError = 1,
     BusError = 2,
     VerificationError = 3,
+    NonInitialised = 4,
 }
 
 const OCTOSPI2_MEMORY_MAPPED_ADDRESS: u32 = 0x70000000;
@@ -32,11 +35,15 @@ const FLASH_SIZE: u32 = 0x200000;
 const ERASED_VALUE: u8 = 0xff;
 const PAGE_SIZE: u16 = 0x100;
 
-struct Algorithm {
+struct InitialisedState {
     flash: Flash,
     led: Output<'static>,
     fpga_creset_b: Output<'static>,
 }
+
+static STATE: Mutex<RefCell<Option<InitialisedState>>> = Mutex::new(RefCell::new(None));
+
+struct Algorithm {}
 
 algorithm!(Algorithm, {
     device_name: "W25Q16JVUXIQ",
@@ -55,92 +62,143 @@ algorithm!(Algorithm, {
 
 impl FlashAlgorithm for Algorithm {
     fn new(_address: u32, _clock: u32, _function: Function) -> Result<Self, ErrorCode> {
-        rtt_init_print!();
-        rprintln!("Init");
 
-        // Initialize peripherals & RCC.
-        let p = rcc_setup::stm32h735g_init();
+        // IMPORTANT
+        // currently target-gen re-uploads the algorithm for every test, but this is NOT how
+        // prove-rs works, probe-rs uploads the algorithm ONCE, then will call `init()` multiple
+        // times.
+        //
+        // this means we have to have some global state and initialise RTT and the CPU just once,
+        // then save the state.
+        //
+        // the first approach to this, done at almost midnight after a very very long day uses
+        // a Mutex to do this, which adds mutex bloat everywhere and is less than elegant.
+        //
+        // Additionally, `drop` is called for each call to `new` but it seems there's only ever
+        // one instance at a given time so there is no-where to actually un-unit the hardware or
+        // drop the global state once it's created.
+        //
+        // Cleanup and refactoring is required, as time permits (i.e. probably never).
+        //
+        // NOTE this will also leave the FPGA disabled until the MCU starts it again.
 
-        // Output pin PA8 (also MCO)
-        let led = Output::new(p.PA8, Level::High, Speed::Low);
+        critical_section::with(|cs| {
+            let mut state = STATE.borrow_ref_mut(cs);
+            if state.is_some() {
+                rprintln!("Re-entrant, init already complete");
+            } else {
+                rtt_init_print!();
+                rprintln!("Init");
 
-        // on the test board, there is an FPGA connected to the OCTOSPI data lines so that the FPGA
-        // can boot from the flash, with an unprogrammed FPGA it will have weak pull-ups on every IO pin
-        // and these need to be disabled before the flash can be communicated with.
-        // or, if the FPGA is running, it needs to be stopped first so that it doesn't interfere with
-        // flash operations.
+                // Initialize peripherals & RCC.
+                let p = rcc_setup::stm32h735g_init();
 
-        // hold FPGA in RESET mode
-        let mut fpga_creset_b = Output::new(p.PF15, Level::Low, Speed::Low);
-        fpga_creset_b.set_low();
+                // Output pin PA8 (also MCO)
+                let led = Output::new(p.PA8, Level::High, Speed::Low);
 
-        let resources = FlashResources {
-            ospi: p.OCTOSPI2,
-            clk: p.PF4,  // P2_CLK
-            d0: p.PD4,  // P1_IO4
-            d1: p.PH3,  // P1_IO5
-            d2: p.PC3,  // P1_IO6
-            d3: p.PE10, // P1_IO7
-            ncs: p.PG12, // P2_NCS
-        };
+                // on the test board, there is an FPGA connected to the OCTOSPI data lines so that the FPGA
+                // can boot from the flash, with an unprogrammed FPGA it will have weak pull-ups on every IO pin
+                // and these need to be disabled before the flash can be communicated with.
+                // or, if the FPGA is running, it needs to be stopped first so that it doesn't interfere with
+                // flash operations.
 
-        let mut flash = Flash::new(resources);
-        let reset_period = flash.reset()
-            .map_err(|_ospi_error|ErrorCode::new(ErrorCodes::UnknownError as u32).unwrap())?;
+                // hold FPGA in RESET mode
+                let mut fpga_creset_b = Output::new(p.PF15, Level::Low, Speed::Low);
+                fpga_creset_b.set_low();
 
-        block_for(reset_period);
+                let resources = FlashResources {
+                    ospi: p.OCTOSPI2,
+                    clk: p.PF4,  // P2_CLK
+                    d0: p.PD4,  // P1_IO4
+                    d1: p.PH3,  // P1_IO5
+                    d2: p.PC3,  // P1_IO6
+                    d3: p.PE10, // P1_IO7
+                    ncs: p.PG12, // P2_NCS
+                };
+
+                let mut flash = Flash::new(resources);
+                let reset_period = flash.reset()
+                    .map_err(|_ospi_error|ErrorCode::new(ErrorCodes::UnknownError as u32).unwrap())?;
+
+                block_for(reset_period);
 
 
-        let flash_id = flash.read_id()
-            .map_err(|_ospi_error|ErrorCode::new(ErrorCodes::UnknownError as u32).unwrap())?;
-        rprintln!("FlashID: {:?}", flash_id);
-        if flash_id != [0xef, 0x40, 0x15] {
-            return Err(ErrorCode::new(flash_id[0] as u32).unwrap());
-        }
+                let flash_id = flash.read_id()
+                    .map_err(|_ospi_error|ErrorCode::new(ErrorCodes::UnknownError as u32).unwrap())?;
+                rprintln!("FlashID: {:?}", flash_id);
+                if flash_id != [0xef, 0x40, 0x15] {
+                    return Err(ErrorCode::new(flash_id[0] as u32).unwrap());
+                }
 
-        if false {
-            let mut buffer: [u8; PAGE_SIZE as usize] = [0; PAGE_SIZE as usize];
+                if false {
+                    let mut buffer: [u8; PAGE_SIZE as usize] = [0; PAGE_SIZE as usize];
 
-            if let Ok(buffer) = flash.read_quad_output_blocking(0x00000000, &mut buffer) {
-                dump_chunk(&buffer);
+                    if let Ok(buffer) = flash.read_quad_output_blocking(0x00000000, &mut buffer) {
+                        dump_chunk(&buffer);
+                    }
+                }
+
+                rprintln!("Init complete, flash ID as-expected");
+
+                *state = Some(InitialisedState { flash, led, fpga_creset_b })
             }
-        }
-
-        rprintln!("Init complete, flash ID as-expected");
-        Ok(Self { flash, led, fpga_creset_b })
+            Ok(Self{})
+        })
     }
 
     fn erase_all(&mut self) -> Result<(), ErrorCode> {
         rprintln!("Erase All");
-        self.flash.chip_erase_blocking()
-            .map_err(|_ospi_error|ErrorCode::new(ErrorCodes::UnknownError as u32).unwrap())?;
-        Ok(())
+
+        critical_section::with(|cs| {
+            let mut state = STATE.borrow_ref_mut(cs);
+            let Some(ref mut state) = *state else {
+                return Err(ErrorCode::new(ErrorCodes::NonInitialised as u32).unwrap())
+            };
+
+            state.flash.chip_erase_blocking()
+                .map_err(|_ospi_error| ErrorCode::new(ErrorCodes::UnknownError as u32).unwrap())?;
+            Ok(())
+        })
     }
 
     fn erase_sector(&mut self, address: u32) -> Result<(), ErrorCode> {
-        // TODO validate the logical address is within range the memory mapped range
-        // Err(ErrorCode::new(0x....).unwrap())
-        rprintln!("Erase sector addr: 0x{:08x}", address);
+        critical_section::with(|cs| {
+            let mut state = STATE.borrow_ref_mut(cs);
+            let Some(ref mut state) = *state else {
+                return Err(ErrorCode::new(ErrorCodes::NonInitialised as u32).unwrap())
+            };
 
-        let physical_address = Self::logical_to_physical(address);
-        rprintln!("Physical addr: 0x{:08x}", physical_address);
+            // TODO validate the logical address is within range the memory mapped range
+            // Err(ErrorCode::new(0x....).unwrap())
+            rprintln!("Erase sector addr: 0x{:08x}", address);
 
-        // TODO validate that physical address starts on a sector boundary (0 <= n < size - sector_size)?
-        //      or does probe-rs already enforce these?
-        // Err(ErrorCode::new(0x....).unwrap())
+            let physical_address = Self::logical_to_physical(address);
+            rprintln!("Physical addr: 0x{:08x}", physical_address);
 
-        self.flash.erase_sector_blocking(physical_address)
-            .map_err(|_ospi_error|ErrorCode::new(ErrorCodes::BusError as u32).unwrap())?;
-        Ok(())
+            // TODO validate that physical address starts on a sector boundary (0 <= n < size - sector_size)?
+            //      or does probe-rs already enforce these?
+            // Err(ErrorCode::new(0x....).unwrap())
+
+            state.flash.erase_sector_blocking(physical_address)
+                .map_err(|_ospi_error| ErrorCode::new(ErrorCodes::BusError as u32).unwrap())?;
+            Ok(())
+        })
     }
 
     fn program_page(&mut self, address: u32, buffer: &[u8]) -> Result<(), ErrorCode> {
-        let len = buffer.len();
-        rprintln!("Program Page. addr: 0x{:08x}, size: 0x{:08x} ({})", address, len, len);
-        let physical_address = Self::logical_to_physical(address);
-        self.flash.program_page_blocking(physical_address, buffer)
-            .map_err(|_ospi_error|ErrorCode::new(ErrorCodes::BusError as u32).unwrap())?;
-        Ok(())
+        critical_section::with(|cs| {
+            let mut state = STATE.borrow_ref_mut(cs);
+            let Some(ref mut state) = *state else {
+                return Err(ErrorCode::new(ErrorCodes::NonInitialised as u32).unwrap())
+            };
+
+            let len = buffer.len();
+            rprintln!("Program Page. addr: 0x{:08x}, size: 0x{:08x} ({})", address, len, len);
+            let physical_address = Self::logical_to_physical(address);
+            state.flash.program_page_blocking(physical_address, buffer)
+                .map_err(|_ospi_error| ErrorCode::new(ErrorCodes::BusError as u32).unwrap())?;
+            Ok(())
+        })
     }
 
     fn verify(
@@ -149,22 +207,92 @@ impl FlashAlgorithm for Algorithm {
         size: u32,
         data: Option<&[u8]>,
     ) -> Result<(), u32> {
-        rprintln!("Verify. logical address: {}, size: {}, verify_data: {} ",address, size, data.is_some());
-        if let Some(data) = data {
+        critical_section::with(|cs| {
+            let mut state = STATE.borrow_ref_mut(cs);
+            let Some(ref mut state) = *state else {
+                // The caller will never know why this failed.
+                return Err(address)
+            };
 
+            rprintln!("Verify. logical address: {}, size: {}, verify_data: {} ",address, size, data.is_some());
+            if let Some(data) = data {
+                let physical_address = Self::logical_to_physical(address);
+
+                let mut offset: u32 = 0;
+                let mut chunk_buffer: [u8; 4096] = [0; 4096];
+
+                let mut remaining: usize = size as usize;
+                while remaining > 0 {
+                    let chunk_size: usize = remaining.min(4096);
+                    let chunk = &mut chunk_buffer[0..chunk_size];
+                    rprintln!("Reading: 0x{:08x}, size: 0x{:08x} ({})", physical_address, chunk.len(), chunk.len());
+
+                    state.flash.read_quad_output_blocking(physical_address, chunk)
+                        .map_err(|_ospi_error| ErrorCode::new(ErrorCodes::BusError as u32).unwrap())?;
+
+                    if false {
+                        dump_chunk(chunk);
+                    }
+                    remaining -= chunk_size;
+
+                    for (_index, byte) in chunk.iter().enumerate() {
+                        let expected = data[offset as usize];
+                        let actual = *byte;
+                        if actual != expected {
+                            rprintln!("Verification failed. offset: 0x{:08x}, expected: 0x{:02x}, actual: 0x{:02x}", offset, expected, actual);
+                            // TODO it would be good to report the offset and the actual byte value that was different via the API itself.
+                            return Err(offset)
+                        }
+                        offset += 1;
+                    }
+                }
+
+                Ok(())
+            } else {
+                // FIXME What is the intention of having `data` being an Option? What is supposed to be verified?!?
+                Ok(())
+            }
+        })
+    }
+
+    fn read_flash(&mut self, address: u32, data: &mut [u8]) -> Result<(), ErrorCode> {
+        critical_section::with(|cs| {
+            let mut state = STATE.borrow_ref_mut(cs);
+            let Some(ref mut state) = *state else {
+                return Err(ErrorCode::new(ErrorCodes::NonInitialised as u32).unwrap())
+            };
+
+            rprintln!("Read. logical_address: 0x{:08x}", address);
+            let physical_address = Self::logical_to_physical(address);
+            state.flash.read_quad_output_blocking(physical_address, data)
+                .map_err(|_ospi_error| ErrorCode::new(ErrorCodes::BusError as u32).unwrap())?;
+
+            Ok(())
+        })
+    }
+
+    fn blank_check(&mut self, address: u32, size: u32, pattern: u8) -> Result<(), ErrorCode> {
+        critical_section::with(|cs| {
+            let mut state = STATE.borrow_ref_mut(cs);
+            let Some(ref mut state) = *state else {
+                return Err(ErrorCode::new(ErrorCodes::NonInitialised as u32).unwrap())
+            };
+
+            rprintln!("Blank check. logical_address: 0x{:08x}, size: 0x{:08x} ({}), pattern: 0x{:02x} (0b{:08b})", address, size, size, pattern, pattern);
             let physical_address = Self::logical_to_physical(address);
 
-            let mut offset: u32 = 0;
             let mut chunk_buffer: [u8; 4096] = [0; 4096];
 
             let mut remaining: usize = size as usize;
+            let mut offset: u32 = 0;
+
             while remaining > 0 {
                 let chunk_size: usize = remaining.min(4096);
                 let chunk = &mut chunk_buffer[0..chunk_size];
                 rprintln!("Reading: 0x{:08x}, size: 0x{:08x} ({})", physical_address, chunk.len(), chunk.len());
 
-                self.flash.read_quad_output_blocking(physical_address, chunk)
-                    .map_err(|_ospi_error|ErrorCode::new(ErrorCodes::BusError as u32).unwrap())?;
+                state.flash.read_quad_output_blocking(physical_address, chunk)
+                    .map_err(|_ospi_error| ErrorCode::new(ErrorCodes::BusError as u32).unwrap())?;
 
                 if false {
                     dump_chunk(chunk);
@@ -172,66 +300,17 @@ impl FlashAlgorithm for Algorithm {
                 remaining -= chunk_size;
 
                 for (_index, byte) in chunk.iter().enumerate() {
-                    let expected = data[offset as usize];
-                    let actual = *byte;
-                    if actual != expected {
-                        rprintln!("Verification failed. offset: 0x{:08x}, expected: 0x{:02x}, actual: 0x{:02x}", offset, expected, actual);
+                    if *byte != pattern {
                         // TODO it would be good to report the offset and the actual byte value that was different via the API itself.
-                        return Err(offset)
+                        rprintln!("Verification failed. offset: 0x{:08x}, expected: 0x{:02x}, actual: 0x{:02x}", offset, pattern, *byte);
+                        return Err(ErrorCode::new(ErrorCodes::VerificationError as u32).unwrap())
                     }
                     offset += 1;
                 }
             }
 
             Ok(())
-        } else {
-            // FIXME What is the intention of having `data` being an Option? What is supposed to be verified?!?
-            Ok(())
-        }
-    }
-
-    fn read_flash(&mut self, address: u32, data: &mut [u8]) -> Result<(), ErrorCode> {
-        rprintln!("Read. logical_address: 0x{:08x}", address);
-        let physical_address = Self::logical_to_physical(address);
-        self.flash.read_quad_output_blocking(physical_address, data)
-            .map_err(|_ospi_error|ErrorCode::new(ErrorCodes::BusError as u32).unwrap())?;
-
-        Ok(())
-    }
-
-    fn blank_check(&mut self, address: u32, size: u32, pattern: u8) -> Result<(), ErrorCode> {
-        rprintln!("Blank check. logical_address: 0x{:08x}, size: 0x{:08x} ({}), pattern: 0x{:02x} (0b{:08b})", address, size, size, pattern, pattern);
-        let physical_address = Self::logical_to_physical(address);
-
-        let mut chunk_buffer: [u8; 4096] = [0; 4096];
-
-        let mut remaining: usize = size as usize;
-        let mut offset: u32 = 0;
-
-        while remaining > 0 {
-            let chunk_size: usize = remaining.min(4096);
-            let chunk = &mut chunk_buffer[0..chunk_size];
-            rprintln!("Reading: 0x{:08x}, size: 0x{:08x} ({})", physical_address, chunk.len(), chunk.len());
-
-            self.flash.read_quad_output_blocking(physical_address, chunk)
-                .map_err(|_ospi_error|ErrorCode::new(ErrorCodes::BusError as u32).unwrap())?;
-
-            if false {
-                dump_chunk(chunk);
-            }
-            remaining -= chunk_size;
-
-            for (_index, byte) in chunk.iter().enumerate() {
-                if *byte != pattern {
-                    // TODO it would be good to report the offset and the actual byte value that was different via the API itself.
-                    rprintln!("Verification failed. offset: 0x{:08x}, expected: 0x{:02x}, actual: 0x{:02x}", offset, pattern, *byte);
-                    return Err(ErrorCode::new(ErrorCodes::VerificationError as u32).unwrap())
-                }
-                offset += 1;
-            }
-        }
-
-        Ok(())
+        })
     }
 }
 
@@ -272,9 +351,15 @@ impl Algorithm {
 
 impl Drop for Algorithm {
     fn drop(&mut self) {
-        // TODO: Add code here to uninitialize the flash algorithm.
-        rprintln!("Dropped");
-        self.led.set_low();
+        critical_section::with(|cs| {
+            let mut state = STATE.borrow_ref_mut(cs);
+            let Some(ref mut state) = *state else {
+                return;
+            };
+
+            rprintln!("Dropped");
+            state.led.set_low();
+        })
     }
 }
 
