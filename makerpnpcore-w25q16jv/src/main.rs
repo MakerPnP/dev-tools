@@ -98,10 +98,12 @@ impl FlashAlgorithm for Algorithm {
             return Err(ErrorCode::new(flash_id[0] as u32).unwrap());
         }
 
-        let mut buffer: [u8; PAGE_SIZE as usize] = [0; PAGE_SIZE as usize];
+        if false {
+            let mut buffer: [u8; PAGE_SIZE as usize] = [0; PAGE_SIZE as usize];
 
-        if let Ok(buffer) = flash.read_quad_output_blocking(0x00000000, &mut buffer) {
-            dump_chunk(&buffer);
+            if let Ok(buffer) = flash.read_quad_output_blocking(0x00000000, &mut buffer) {
+                dump_chunk(&buffer);
+            }
         }
 
         rprintln!("Init complete, flash ID as-expected");
