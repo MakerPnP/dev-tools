@@ -8,6 +8,8 @@
 #![no_std]
 #![no_main]
 
+use panic_probe as _;
+
 use core::arch::asm;
 use core::fmt::{Debug, Formatter, Write};
 use embassy_stm32::gpio::{Level, Output, Speed};
@@ -593,16 +595,6 @@ mod rcc_setup {
 
         rprintln!("Full init");
         embassy_stm32::init(config)
-    }
-}
-
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    rprintln!("I panicked");
-
-    unsafe {
-        core::arch::asm!("udf #0");
-        core::hint::unreachable_unchecked();
     }
 }
 
