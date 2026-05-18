@@ -82,7 +82,6 @@ impl FlashAlgorithm for Algorithm {
             ncs: p.PG12, // P2_NCS
         };
 
-        // TODO: Add setup code for the flash algorithm.
         let mut flash = Flash::new(resources);
         let reset_period = flash.reset()
             .map_err(|_ospi_error|ErrorCode::new(ErrorCodes::UnknownError as u32).unwrap())?;
