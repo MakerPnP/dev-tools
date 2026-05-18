@@ -1,3 +1,10 @@
+//! Implementation of the flash-algorithm for the MakerPnPControl-CORE board
+//! PCB Revision: RevA1
+//!
+//! Run with this environment setup to see more log output
+//! ```
+//! RUST_LOG=trace,nusb=info,probe_rs::probe=info
+//! ```
 #![no_std]
 #![no_main]
 
@@ -540,6 +547,9 @@ mod rcc_setup {
         rprintln!("PWR::CR3 = 0x{:08x} {:?}", reg.0, reg);
         let reg = pac::RCC.ahb4enr().read();
         rprintln!("RCC::AHB4ENR = 0x{:08x} {:?}", reg.0, reg);
+        let reg = pac::WWDG1.cr().read();
+        rprintln!("WWDG1::cr = 0x{:08x} {:?}", reg.0, reg);
+
         rprintln!("Full init");
         embassy_stm32::init(config)
     }
