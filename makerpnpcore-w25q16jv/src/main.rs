@@ -3,7 +3,7 @@
 
 use core::fmt::{Debug, Formatter, Write};
 use embassy_stm32::gpio::{Level, Output, Speed};
-use embassy_stm32::ospi::{AddressSize, DummyCycles, Ospi, OspiWidth, TransferConfig};
+use embassy_stm32::ospi::{AddressSize, DummyCycles, Ospi, OspiError, OspiWidth, TransferConfig};
 use embassy_stm32::{ospi, Peri};
 use embassy_stm32::ospi::{ChipSelectHighTime, FIFOThresholdLevel, MemorySize, MemoryType, WrapSize};
 use embassy_stm32::peripherals::{PC3, PD4, PE10, PF4, PG12, PH3};
@@ -13,7 +13,9 @@ use rtt_target::{rprint, rprintln, rtt_init_print};
 
 #[repr(u32)]
 enum ErrorCodes {
-    VerificationError = 1,
+    UnknownError = 1,
+    BusError = 2,
+    VerificationError = 3,
 }
 
 const OCTOSPI2_MEMORY_MAPPED_ADDRESS: u32 = 0x70000000;
@@ -75,12 +77,14 @@ impl FlashAlgorithm for Algorithm {
 
         // TODO: Add setup code for the flash algorithm.
         let mut flash = Flash::new(resources);
-        let reset_period = flash.reset();
+        let reset_period = flash.reset()
+            .map_err(|_ospi_error|ErrorCode::new(ErrorCodes::UnknownError as u32).unwrap())?;
 
         block_for(reset_period);
 
 
-        let flash_id = flash.read_id();
+        let flash_id = flash.read_id()
+            .map_err(|_ospi_error|ErrorCode::new(ErrorCodes::UnknownError as u32).unwrap())?;
         rprintln!("FlashID: {:?}", flash_id);
         if flash_id != [0xef, 0x40, 0x15] {
             return Err(ErrorCode::new(flash_id[0] as u32).unwrap());
@@ -88,8 +92,9 @@ impl FlashAlgorithm for Algorithm {
 
         let mut buffer: [u8; PAGE_SIZE as usize] = [0; PAGE_SIZE as usize];
 
-        flash.read_quad_output_blocking(0x00000000, &mut buffer);
-        dump_chunk(&buffer);
+        if let Ok(buffer) = flash.read_quad_output_blocking(0x00000000, &mut buffer) {
+            dump_chunk(&buffer);
+        }
 
         rprintln!("Init complete, flash ID as-expected");
         Ok(Self { flash, led, fpga_creset_b })
@@ -97,7 +102,8 @@ impl FlashAlgorithm for Algorithm {
 
     fn erase_all(&mut self) -> Result<(), ErrorCode> {
         rprintln!("Erase All");
-        self.flash.chip_erase_blocking();
+        self.flash.chip_erase_blocking()
+            .map_err(|_ospi_error|ErrorCode::new(ErrorCodes::UnknownError as u32).unwrap())?;
         Ok(())
     }
 
@@ -113,7 +119,8 @@ impl FlashAlgorithm for Algorithm {
         //      or does probe-rs already enforce these?
         // Err(ErrorCode::new(0x....).unwrap())
 
-        self.flash.erase_sector_blocking(physical_address);
+        self.flash.erase_sector_blocking(physical_address)
+            .map_err(|_ospi_error|ErrorCode::new(ErrorCodes::BusError as u32).unwrap())?;
         Ok(())
     }
 
@@ -121,7 +128,8 @@ impl FlashAlgorithm for Algorithm {
         let len = buffer.len();
         rprintln!("Program Page. addr: 0x{:08x}, size: 0x{:08x} ({})", address, len, len);
         let physical_address = Self::logical_to_physical(address);
-        self.flash.program_page_blocking(physical_address, buffer);
+        self.flash.program_page_blocking(physical_address, buffer)
+            .map_err(|_ospi_error|ErrorCode::new(ErrorCodes::BusError as u32).unwrap())?;
         Ok(())
     }
 
@@ -141,7 +149,8 @@ impl FlashAlgorithm for Algorithm {
     fn read_flash(&mut self, address: u32, data: &mut [u8]) -> Result<(), ErrorCode> {
         rprintln!("Read. logical_address: 0x{:08x}", address);
         let physical_address = Self::logical_to_physical(address);
-        self.flash.read_quad_output_blocking(physical_address, data);
+        self.flash.read_quad_output_blocking(physical_address, data)
+            .map_err(|_ospi_error|ErrorCode::new(ErrorCodes::BusError as u32).unwrap())?;
 
         Ok(())
     }
@@ -158,7 +167,8 @@ impl FlashAlgorithm for Algorithm {
             let chunk = &mut chunk_buffer[0..chunk_size];
             rprintln!("Reading: 0x{:08x}, size: 0x{:08x} ({})", physical_address, chunk.len(), chunk.len());
 
-            self.flash.read_quad_output_blocking(physical_address, chunk);
+            self.flash.read_quad_output_blocking(physical_address, chunk)
+                .map_err(|_ospi_error|ErrorCode::new(ErrorCodes::BusError as u32).unwrap())?;
 
             if false {
                 dump_chunk(chunk);
@@ -240,6 +250,11 @@ struct FlashResources {
     ncs: Peri<'static, PG12>,
 }
 
+enum FlashError {
+    #[allow(unused)]
+    OspiError(OspiError)
+}
+
 struct Flash {
     ospi: Ospi<'static, embassy_stm32::peripherals::OCTOSPI2, embassy_stm32::mode::Blocking>,
 }
@@ -282,14 +297,14 @@ impl Flash {
     }
 
     /// reset the flash chip, the caller must wait for the returned time before issuing further commannds
-    pub fn reset(&mut self) -> Duration {
-        self.exec_command(CMD_ENABLE_RESET);
-        self.exec_command(CMD_RESET_DEVICE);
+    pub fn reset(&mut self) -> Result<Duration, FlashError> {
+        self.exec_command(CMD_ENABLE_RESET)?;
+        self.exec_command(CMD_RESET_DEVICE)?;
 
-        Duration::from_micros(30)
+        Ok(Duration::from_micros(30))
     }
 
-    pub fn exec_command(&mut self, cmd: u8) {
+    pub fn exec_command(&mut self, cmd: u8) -> Result<(), FlashError> {
         let transaction: TransferConfig = TransferConfig {
             iwidth: OspiWidth::SING,
             isize: AddressSize::_8Bit,
@@ -298,9 +313,10 @@ impl Flash {
             instruction: Some(cmd as u32),
             ..Default::default()
         };
-        self.ospi.blocking_command(&transaction).unwrap();
+        self.ospi.blocking_command(&transaction).map_err(FlashError::OspiError)
     }
-    pub fn read_id(&mut self) -> [u8; 3] {
+
+    pub fn read_id(&mut self) -> Result<[u8; 3], FlashError> {
         let mut buffer = [0; 3];
         let transaction: TransferConfig = TransferConfig {
             iwidth: OspiWidth::SING,
@@ -310,17 +326,17 @@ impl Flash {
             instruction: Some(CMD_READ_ID as u32),
             ..Default::default()
         };
-        self.ospi.blocking_read(&mut buffer, transaction).unwrap();
-        buffer
+        self.ospi.blocking_read(&mut buffer, transaction).map_err(FlashError::OspiError)?;
+        Ok(buffer)
     }
 
-    pub fn chip_erase_blocking(&mut self) {
-        self.exec_command(CMD_WRITE_ENABLE);
-        self.exec_command(CMD_CHIP_ERASE);
-        self.wait_write_finish();
+    pub fn chip_erase_blocking(&mut self) -> Result<(), FlashError> {
+        self.exec_command(CMD_WRITE_ENABLE)?;
+        self.exec_command(CMD_CHIP_ERASE)?;
+        self.wait_write_finish(Duration::from_millis(250))
     }
 
-    pub fn read_status1(&mut self) -> StatusReg {
+    pub fn read_status1(&mut self) -> Result<StatusReg, FlashError> {
         let mut buffer = [0_u8];
         let transaction: TransferConfig = TransferConfig {
             iwidth: OspiWidth::SING,
@@ -330,18 +346,19 @@ impl Flash {
             instruction: Some(CMD_READ_STATUS_1 as u32),
             ..Default::default()
         };
-        self.ospi.blocking_read(&mut buffer, transaction).unwrap();
+        self.ospi.blocking_read(&mut buffer, transaction).map(|_| {
+            let status = StatusReg::from_raw(buffer[0]);
 
-        let status = StatusReg::from_raw(buffer[0]);
-
-        status
+            status
+        })
+            .map_err(FlashError::OspiError)
     }
 
-    fn wait_write_finish(&mut self) {
+    fn wait_write_finish(&mut self, re_check_duration: Duration) -> Result<(), FlashError> {
         let mut recent_status: Option<StatusReg> = None;
 
         loop {
-            let status = self.read_status1();
+            let status = self.read_status1()?;
             let print = match &recent_status {
                 Some(previous) if *previous != status => true,
                 None => true,
@@ -355,11 +372,15 @@ impl Flash {
             }
 
             recent_status.replace(status);
+
+            block_for(re_check_duration);
         }
+
+        Ok(())
     }
 
-    fn erase_sector_blocking(&mut self, address: u32) {
-        self.exec_command(CMD_WRITE_ENABLE);
+    fn erase_sector_blocking(&mut self, address: u32) -> Result<(), FlashError> {
+        self.exec_command(CMD_WRITE_ENABLE)?;
 
         let transaction: TransferConfig = TransferConfig {
             iwidth: OspiWidth::SING,
@@ -371,13 +392,15 @@ impl Flash {
             ..Default::default()
         };
         rprintln!("Erasing sector");
-        self.ospi.blocking_command(&transaction).unwrap();
+        self.ospi.blocking_command(&transaction)
+            .map_err(FlashError::OspiError)?;
         rprintln!("Waiting for write to finish");
-        self.wait_write_finish();
+        self.wait_write_finish(Duration::from_millis(5))?;
         rprintln!("OK");
+        Ok(())
     }
 
-    pub fn read_quad_output_blocking(&mut self, address: u32, buffer: &mut [u8]) {
+    pub fn read_quad_output_blocking<'b>(&mut self, address: u32, buffer: &'b mut [u8]) -> Result<&'b mut [u8], FlashError>{
         let transaction: TransferConfig = TransferConfig {
             iwidth: OspiWidth::SING,
             instruction: Some(CMD_FAST_READ_QUAD_OUTPUT as u32),
@@ -393,13 +416,15 @@ impl Flash {
             ..Default::default()
         };
         rprintln!("read_quad_output. address: 0x{:08x}, data_length: {:?}", address, buffer.len());
-        self.ospi.blocking_read(buffer, transaction).unwrap()
+        self.ospi.blocking_read(buffer, transaction)
+            .map_err(FlashError::OspiError)?;
+        Ok(buffer)
     }
 
-    pub(crate) fn program_page_blocking(&mut self, address: u32, buffer: &[u8]) {
+    pub(crate) fn program_page_blocking(&mut self, address: u32, buffer: &[u8]) -> Result<(), FlashError> {
         // TODO check that buffer length <= page size
 
-        self.exec_command(CMD_WRITE_ENABLE);
+        self.exec_command(CMD_WRITE_ENABLE)?;
 
         let transaction: TransferConfig = TransferConfig {
             iwidth: OspiWidth::SING,
@@ -418,7 +443,8 @@ impl Flash {
 
         self.ospi.blocking_write(buffer, transaction).unwrap();
 
-        self.wait_write_finish();
+        self.wait_write_finish(Duration::from_micros(100))?;
+        Ok(())
     }
 }
 

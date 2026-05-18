@@ -19,7 +19,11 @@ rustflags = [
   "-C",
   "force-frame-pointers=no",
 ]
-runner = "target-gen test template.yaml target/definition.yaml"
+# Currently this requires a version of target-gen that has fixes for verification using the flash algo API.
+# The version of target-gen in the probe-rs repo as of 2026/05/18 does not use the API for readback
+# and also has issues with missing RTT output.
+runner = "../../../probe-rs/target/debug/target-gen test template.yaml target/definition.yaml"
+#runner = "target-gen test template.yaml target/definition.yaml"
 
 [build]
 target = "thumbv7em-none-eabihf"
