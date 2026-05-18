@@ -204,15 +204,19 @@ fn dump_chunk(chunk: &[u8]) {
 
     let mut offset: usize = 0;
     for _ in 0..lines {
-        rprint!("0x{:08x}: ", offset);
-        for index in 0..ITEMS_PER_LINE {
-            rprint!("{:02x}", chunk[offset]);
-            if index % 8 == 0 {
-                rprint!("")
+        if true {
+            rprint!("0x{:08x}:", offset);
+            for index in 0..ITEMS_PER_LINE {
+                if index % 8 == 0 {
+                    rprint!(" ")
+                }
+                rprint!("{:02x}", chunk[offset]);
+                offset += 1;
             }
-            offset += 1;
+        } else {
+            rprintln!("0x{:08x}: {:02x?}", offset, &chunk[offset..offset + ITEMS_PER_LINE]);
+            offset += ITEMS_PER_LINE;
         }
-
         rprintln!("");
 
         block_for(rtt_line_period);
