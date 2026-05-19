@@ -44,7 +44,21 @@ does NOT use the flash-api, it uses the core directly.  Changes to probe-rs woul
 
 ### Gotchas
 
-It was found that an earlier version of the impl works in target-gen but not probe-rs. with probe-rs it would crash
+As part of this implementation a feedback issue was created on the probe-rs repo, if you're implementing a flash algo 
+please read the feedback, it will save you from the hours of debugging headaches that was endured.
+
+https://github.com/probe-rs/probe-rs/issues/4016
+
+Four main gotchas:
+
+1) interrupts are never called, due to lack of a vector table or vector table init code in probe-rs. thus you cannot
+use dependencies like embassy-time and methods like 'block_for' or any non-blocking peripheral code that requires
+interrupts to function.  
+
+2) panic handlers are never called, for the same reason above, a vector table entry for a hard-fault handler is 
+required for them to work.  you get a core lockup instead.
+
+3) It was found that an earlier version of the impl works in target-gen but not probe-rs. with probe-rs it would crash
 as soon as the program phase was started. it turned out there was a massive difference between how target-gen and
 probe-rs uses the flash-algo-impl:
 
@@ -59,6 +73,9 @@ who knows, just speculating... but for example see: https://github.com/kevswims/
 
 The log from target-gen below also shows `LOADING ALGO` being printed multiple times, indicating that the global state is
 gone between target-gen tests. Debug code was added to probe-rs to highlight this.
+
+4) it's not currently possible to use the `read` function of probe-rs to read a flash chip, even if you've implemented
+`read_flash`.  details in the feedback issue linked above.
 
 ### Log
 ```

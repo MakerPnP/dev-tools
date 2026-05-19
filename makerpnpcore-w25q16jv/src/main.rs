@@ -8,8 +8,6 @@
 #![no_std]
 #![no_main]
 
-use panic_probe as _;
-
 use core::arch::asm;
 use core::cell::RefCell;
 use core::fmt::{Debug, Formatter, Write};
@@ -683,6 +681,21 @@ mod rcc_setup {
         rprintln!("Full init");
         embassy_stm32::init(config)
     }
+}
+
+/// THIS WILL NEVER BE CALLED!
+///
+/// A Panic handler requires an interrupt vector table to work, usually the hard-fault
+/// handler calls or *is* the panic handler.
+///
+/// Refer to cortex-m-rt crate documentation regarding `HardFault`.
+///
+/// Since this is never called, because probe-rs/target-gen do not set up a vector table, it means
+/// that you will always get a 'core lockup' state when a hard-fault occurs, which is a nightmare
+/// for debugging or understanding reasons for failure.
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {}
 }
 
 fn block_for(micros: u32) {
